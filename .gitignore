@@ -57,6 +57,7 @@ vite.config.js.timestamp-*
 # Rust / Tauri backend
 target/
 **/target/
+apps/desktop/src-tauri/gen/
 *.rs.bk
 
 # Python
@@ -133,4 +134,3 @@ temp/
 *.tmp
 *.bak
 *.orig
-
