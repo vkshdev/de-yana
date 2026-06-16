@@ -1,0 +1,136 @@
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editors and IDEs
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+*.sublime-workspace
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.local
+*.secret
+*.secrets
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+tokens/
+credentials/
+oauth_tokens.json
+token_store.json
+
+# Logs and diagnostics
+*.log
+logs/
+debug/
+diagnostics/
+crash-dumps/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Node / React / Vite / Tauri frontend
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+.vite/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+vite.config.ts.timestamp-*
+vite.config.js.timestamp-*
+
+# Rust / Tauri backend
+target/
+**/target/
+*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.coverage
+htmlcov/
+.hypothesis/
+
+# Local databases and generated storage
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+app-data/
+local-data/
+data/
+vault/
+memory-vault/
+audit-log/
+
+# Local AI models and heavy model artifacts
+.ollama/
+models/
+model-cache/
+*.gguf
+*.ggml
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.tflite
+
+# Voice artifacts
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.webm
+recordings/
+transcripts/
+
+# Build and package output
+out/
+release/
+releases/
+artifacts/
+installer/
+*.msi
+*.exe
+*.dmg
+*.AppImage
+*.deb
+*.rpm
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+*.tmp
+*.bak
+*.orig
+
