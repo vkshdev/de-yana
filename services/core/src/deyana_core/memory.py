@@ -1,0 +1,474 @@
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import uuid
+from pathlib import Path
+
+from .models import (
+    MemoryCreateRequest,
+    MemoryExportResponse,
+    MemoryItem,
+    MemoryListResponse,
+    MemoryReindexResponse,
+    MemoryUpdateRequest,
+)
+from .runtime_time import utc_timestamp
+from .storage import CoreStore, create_vault_template
+
+TYPE_TO_FOLDER = {
+    "daily_summary": "Daily",
+    "project_summary": "Projects",
+    "decision": "Decisions",
+    "action_item": "Tasks",
+    "git_summary": "GitHub",
+    "connector_summary": "Inbox",
+    "file_summary": "Sources",
+    "chat": "Inbox",
+    "note": "Inbox",
+}
+
+
+class MemoryStore:
+    def __init__(self, data_dir: Path, core_store: CoreStore) -> None:
+        self.data_dir = data_dir
+        self.core_store = core_store
+        self.database_path = data_dir / "memory.sqlite3"
+
+    def initialize(self) -> None:
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        with self.connect() as connection:
+            connection.executescript(
+                """
+                PRAGMA foreign_keys = ON;
+
+                CREATE TABLE IF NOT EXISTS memory_items (
+                  id TEXT PRIMARY KEY,
+                  type TEXT NOT NULL,
+                  title TEXT NOT NULL,
+                  summary TEXT NOT NULL,
+                  content_markdown TEXT NOT NULL,
+                  markdown_path TEXT,
+                  source_type TEXT NOT NULL,
+                  source_id TEXT,
+                  source_uri TEXT,
+                  importance INTEGER NOT NULL DEFAULT 3,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  deleted_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS memory_tags (
+                  memory_id TEXT NOT NULL,
+                  tag TEXT NOT NULL,
+                  PRIMARY KEY (memory_id, tag),
+                  FOREIGN KEY (memory_id) REFERENCES memory_items(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS memory_chunks (
+                  id TEXT PRIMARY KEY,
+                  memory_id TEXT NOT NULL,
+                  chunk_text TEXT NOT NULL,
+                  chunk_index INTEGER NOT NULL,
+                  token_estimate INTEGER NOT NULL,
+                  embedding_model TEXT,
+                  embedding_ref TEXT,
+                  created_at TEXT NOT NULL,
+                  FOREIGN KEY (memory_id) REFERENCES memory_items(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_memory_items_deleted_at ON memory_items(deleted_at);
+                CREATE INDEX IF NOT EXISTS idx_memory_items_updated_at ON memory_items(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_memory_items_type ON memory_items(type);
+                """
+            )
+
+    def connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON;")
+        return connection
+
+    def create(self, request: MemoryCreateRequest) -> MemoryItem:
+        self.initialize()
+        vault_root = self.require_vault_root()
+        memory_id = f"memory_{uuid.uuid4().hex}"
+        timestamp = utc_timestamp()
+        content_markdown = request.content_markdown or self.default_content(request.title, request.summary)
+        folder = TYPE_TO_FOLDER.get(request.type, "Inbox")
+        markdown_path = self.markdown_path(vault_root, folder, request.title, memory_id)
+        markdown_content = self.render_markdown(
+            memory_id=memory_id,
+            memory_type=request.type,
+            title=request.title,
+            summary=request.summary,
+            content_markdown=content_markdown,
+            source_type=request.source_type,
+            source_uri=request.source_uri,
+            tags=request.tags,
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+        markdown_path.parent.mkdir(parents=True, exist_ok=True)
+        markdown_path.write_text(markdown_content, encoding="utf-8")
+
+        with self.connect() as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO memory_items (
+                      id, type, title, summary, content_markdown, markdown_path,
+                      source_type, source_id, source_uri, importance,
+                      created_at, updated_at, deleted_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        memory_id,
+                        request.type,
+                        request.title,
+                        request.summary,
+                        content_markdown,
+                        str(markdown_path),
+                        request.source_type,
+                        request.source_id,
+                        request.source_uri,
+                        request.importance,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                self.replace_tags(connection, memory_id, request.tags)
+                self.replace_chunks(connection, memory_id, content_markdown, timestamp)
+
+        return self.get(memory_id)
+
+    def list(self, query: str | None = None, limit: int = 20) -> MemoryListResponse:
+        self.initialize()
+        limit = max(1, min(limit, 100))
+        query_value = (query or "").strip()
+        params: list[object] = []
+        where = "deleted_at IS NULL"
+
+        if query_value:
+            where += """
+              AND (
+                lower(title) LIKE ?
+                OR lower(summary) LIKE ?
+                OR lower(content_markdown) LIKE ?
+                OR id IN (
+                  SELECT memory_id FROM memory_tags WHERE lower(tag) LIKE ?
+                )
+              )
+            """
+            pattern = f"%{query_value.lower()}%"
+            params.extend([pattern, pattern, pattern, pattern])
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM memory_items
+                WHERE {where}
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                [*params, limit],
+            ).fetchall()
+            total = connection.execute(
+                f"SELECT COUNT(*) AS count FROM memory_items WHERE {where}",
+                params,
+            ).fetchone()["count"]
+
+        return MemoryListResponse(
+            items=[self.row_to_item(row) for row in rows],
+            total=total,
+            query=query_value or None,
+        )
+
+    def get(self, memory_id: str) -> MemoryItem:
+        self.initialize()
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM memory_items WHERE id = ? AND deleted_at IS NULL",
+                (memory_id,),
+            ).fetchone()
+
+        if row is None:
+            raise KeyError(memory_id)
+
+        return self.row_to_item(row, read_markdown=True)
+
+    def update(self, memory_id: str, request: MemoryUpdateRequest) -> MemoryItem:
+        current = self.get(memory_id)
+        timestamp = utc_timestamp()
+        title = request.title if request.title is not None else current.title
+        summary = request.summary if request.summary is not None else current.summary
+        content_markdown = (
+            request.content_markdown if request.content_markdown is not None else current.content_markdown
+        )
+        importance = request.importance if request.importance is not None else current.importance
+        tags = request.tags if request.tags is not None else current.tags
+        markdown_path = Path(current.markdown_path) if current.markdown_path else None
+
+        if markdown_path:
+            markdown_content = self.render_markdown(
+                memory_id=memory_id,
+                memory_type=current.type,
+                title=title,
+                summary=summary,
+                content_markdown=content_markdown,
+                source_type=current.source_type,
+                source_uri=current.source_uri,
+                tags=tags,
+                created_at=current.created_at,
+                updated_at=timestamp,
+            )
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(markdown_content, encoding="utf-8")
+
+        with self.connect() as connection:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE memory_items
+                    SET title = ?, summary = ?, content_markdown = ?, importance = ?, updated_at = ?
+                    WHERE id = ? AND deleted_at IS NULL
+                    """,
+                    (title, summary, content_markdown, importance, timestamp, memory_id),
+                )
+                self.replace_tags(connection, memory_id, tags)
+                self.replace_chunks(connection, memory_id, content_markdown, timestamp)
+
+        return self.get(memory_id)
+
+    def delete(self, memory_id: str) -> bool:
+        current = self.get(memory_id)
+        timestamp = utc_timestamp()
+
+        with self.connect() as connection:
+            with connection:
+                cursor = connection.execute(
+                    "UPDATE memory_items SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+                    (timestamp, timestamp, memory_id),
+                )
+                connection.execute("DELETE FROM memory_tags WHERE memory_id = ?", (memory_id,))
+                connection.execute("DELETE FROM memory_chunks WHERE memory_id = ?", (memory_id,))
+
+        if current.markdown_path:
+            try:
+                Path(current.markdown_path).unlink()
+            except FileNotFoundError:
+                pass
+
+        return cursor.rowcount > 0
+
+    def reindex(self) -> MemoryReindexResponse:
+        self.initialize()
+        reindexed = 0
+        missing_markdown = 0
+        timestamp = utc_timestamp()
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM memory_items WHERE deleted_at IS NULL AND markdown_path IS NOT NULL"
+            ).fetchall()
+
+            with connection:
+                for row in rows:
+                    path = Path(row["markdown_path"])
+                    if not path.exists():
+                        missing_markdown += 1
+                        continue
+
+                    content = path.read_text(encoding="utf-8")
+                    title, summary, body = parse_markdown(content, fallback_title=row["title"])
+                    connection.execute(
+                        """
+                        UPDATE memory_items
+                        SET title = ?, summary = ?, content_markdown = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (title, summary, body, timestamp, row["id"]),
+                    )
+                    self.replace_chunks(connection, row["id"], body, timestamp)
+                    reindexed += 1
+
+        return MemoryReindexResponse(reindexed=reindexed, missing_markdown=missing_markdown)
+
+    def export(self) -> MemoryExportResponse:
+        self.initialize()
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_items
+                WHERE deleted_at IS NULL
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+        return MemoryExportResponse(
+            exported_at=utc_timestamp(),
+            items=[self.row_to_item(row) for row in rows],
+        )
+
+    def row_to_item(self, row: sqlite3.Row, read_markdown: bool = False) -> MemoryItem:
+        content_markdown = row["content_markdown"]
+        markdown_path = row["markdown_path"]
+
+        if read_markdown and markdown_path:
+            path = Path(markdown_path)
+            if path.exists():
+                _title, _summary, content_markdown = parse_markdown(
+                    path.read_text(encoding="utf-8"),
+                    fallback_title=row["title"],
+                )
+
+        return MemoryItem(
+            id=row["id"],
+            type=row["type"],
+            title=row["title"],
+            summary=row["summary"],
+            content_markdown=content_markdown,
+            markdown_path=markdown_path,
+            source_type=row["source_type"],
+            source_id=row["source_id"],
+            source_uri=row["source_uri"],
+            importance=row["importance"],
+            tags=self.tags_for(row["id"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            deleted_at=row["deleted_at"],
+        )
+
+    def tags_for(self, memory_id: str) -> list[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT tag FROM memory_tags WHERE memory_id = ? ORDER BY tag",
+                (memory_id,),
+            ).fetchall()
+        return [row["tag"] for row in rows]
+
+    def require_vault_root(self) -> Path:
+        settings = self.core_store.read_settings()
+        if not settings.vault_path:
+            raise ValueError("Complete onboarding and choose a vault before writing memory.")
+
+        vault_root = Path(settings.vault_path)
+        create_vault_template(vault_root)
+        return vault_root
+
+    @staticmethod
+    def markdown_path(vault_root: Path, folder: str, title: str, memory_id: str) -> Path:
+        slug = slugify(title) or "memory"
+        return vault_root / folder / f"{slug}-{memory_id[-8:]}.md"
+
+    @staticmethod
+    def default_content(title: str, summary: str) -> str:
+        return f"# {title}\n\n{summary}\n"
+
+    @staticmethod
+    def render_markdown(
+        memory_id: str,
+        memory_type: str,
+        title: str,
+        summary: str,
+        content_markdown: str,
+        source_type: str,
+        source_uri: str | None,
+        tags: list[str],
+        created_at: str,
+        updated_at: str,
+    ) -> str:
+        frontmatter = {
+            "id": memory_id,
+            "type": memory_type,
+            "source_type": source_type,
+            "source_uri": source_uri,
+            "tags": tags,
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+        lines = ["---"]
+        for key, value in frontmatter.items():
+            lines.append(f"{key}: {json.dumps(value)}")
+        lines.extend(["---", "", f"# {title}", "", f"> {summary}", "", content_markdown.strip(), ""])
+        return "\n".join(lines)
+
+    @staticmethod
+    def replace_tags(connection: sqlite3.Connection, memory_id: str, tags: list[str]) -> None:
+        connection.execute("DELETE FROM memory_tags WHERE memory_id = ?", (memory_id,))
+        for tag in sorted({tag.strip().lower() for tag in tags if tag.strip()}):
+            connection.execute(
+                "INSERT OR IGNORE INTO memory_tags (memory_id, tag) VALUES (?, ?)",
+                (memory_id, tag),
+            )
+
+    @staticmethod
+    def replace_chunks(
+        connection: sqlite3.Connection, memory_id: str, content_markdown: str, created_at: str
+    ) -> None:
+        connection.execute("DELETE FROM memory_chunks WHERE memory_id = ?", (memory_id,))
+        chunks = chunk_text(content_markdown)
+        for index, chunk in enumerate(chunks):
+            connection.execute(
+                """
+                INSERT INTO memory_chunks (
+                  id, memory_id, chunk_text, chunk_index, token_estimate,
+                  embedding_model, embedding_ref, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)
+                """,
+                (
+                    f"chunk_{uuid.uuid4().hex}",
+                    memory_id,
+                    chunk,
+                    index,
+                    max(1, len(chunk.split())),
+                    created_at,
+                ),
+            )
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
+    return slug[:72]
+
+
+def chunk_text(content: str, size: int = 900) -> list[str]:
+    normalized = content.strip()
+    if not normalized:
+        return []
+    return [normalized[index : index + size] for index in range(0, len(normalized), size)]
+
+
+def parse_markdown(content: str, fallback_title: str) -> tuple[str, str, str]:
+    body = strip_frontmatter(content).strip()
+    title = fallback_title
+    lines = body.splitlines()
+
+    for line in lines:
+        if line.startswith("# "):
+            title = line[2:].strip() or fallback_title
+            break
+
+    summary = ""
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            summary = stripped.lstrip("> ").strip()
+            break
+        if stripped and not stripped.startswith("#"):
+            summary = stripped[:240]
+            break
+
+    return title, summary or title, body
+
+
+def strip_frontmatter(content: str) -> str:
+    if not content.startswith("---"):
+        return content
+
+    parts = content.split("---", 2)
+    if len(parts) == 3:
+        return parts[2]
+    return content

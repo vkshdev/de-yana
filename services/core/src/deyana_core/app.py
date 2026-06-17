@@ -8,7 +8,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
-from .api import health_router, lifecycle_router, status_router, websocket_router
+from .api import (
+    health_router,
+    lifecycle_router,
+    memory_router,
+    onboarding_router,
+    settings_router,
+    status_router,
+    vault_router,
+    websocket_router,
+)
 from .runtime import RuntimeState
 
 
@@ -81,6 +90,10 @@ def create_app(runtime: RuntimeState | None = None) -> FastAPI:
 
     app.include_router(health_router)
     app.include_router(status_router)
+    app.include_router(settings_router)
+    app.include_router(onboarding_router)
+    app.include_router(vault_router)
+    app.include_router(memory_router)
     app.include_router(lifecycle_router)
     app.include_router(websocket_router)
     return app

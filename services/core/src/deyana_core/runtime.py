@@ -7,8 +7,11 @@ from datetime import UTC, datetime
 
 from . import __version__
 from .event_bus import EventBus
+from .memory import MemoryStore
 from .models import CoreEvent, DependencyStatus, HealthResponse, StatusResponse
+from .runtime_time import utc_timestamp
 from .settings import CoreSettings
+from .storage import CoreStore
 
 
 class RuntimeState:
@@ -19,6 +22,9 @@ class RuntimeState:
         self.started_at = datetime.now(UTC)
         self.lifecycle = "running"
         self.event_bus = EventBus()
+        self.store = CoreStore(settings.data_dir)
+        self.memory_store = MemoryStore(settings.data_dir, self.store)
+        self.memory_store.initialize()
 
     @property
     def uptime_seconds(self) -> float:
@@ -67,8 +73,10 @@ class RuntimeState:
             feature_flags={
                 "websocketEvents": True,
                 "localLogging": True,
-                "settings": False,
-                "memory": False,
+                "settings": True,
+                "onboarding": True,
+                "vaultSetup": True,
+                "memory": True,
                 "models": False,
                 "connectors": False,
                 "voice": False,
@@ -86,4 +94,4 @@ class RuntimeState:
 
     @staticmethod
     def timestamp() -> str:
-        return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        return utc_timestamp()

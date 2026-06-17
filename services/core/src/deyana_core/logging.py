@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import logging
 from logging.handlers import RotatingFileHandler
+from tempfile import gettempdir
+from pathlib import Path
 
 from .settings import CoreSettings
 
 
 def configure_logging(settings: CoreSettings) -> None:
-    settings.log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = settings.log_dir / "core.log"
-
     root = logging.getLogger()
     root.setLevel(settings.log_level.upper())
     root.handlers.clear()
@@ -19,15 +18,28 @@ def configure_logging(settings: CoreSettings) -> None:
         datefmt="%Y-%m-%dT%H:%M:%S%z",
     )
 
-    file_handler = RotatingFileHandler(
-        log_file,
-        maxBytes=1_000_000,
-        backupCount=3,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(formatter)
-    root.addHandler(file_handler)
-
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     root.addHandler(console_handler)
+
+    file_handler = build_file_handler(settings.log_dir) or build_file_handler(
+        Path(gettempdir()) / "deyana-core" / "logs"
+    )
+    if file_handler is not None:
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+    else:
+        root.warning("file logging is unavailable; continuing with console logging only")
+
+
+def build_file_handler(log_dir: Path) -> RotatingFileHandler | None:
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return RotatingFileHandler(
+            log_dir / "core.log",
+            maxBytes=1_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        )
+    except OSError:
+        return None
