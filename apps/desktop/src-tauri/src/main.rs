@@ -24,7 +24,6 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_desktop_settings,
-            commands::get_phase1_settings,
             commands::set_floating_mode,
             commands::set_always_on_top,
             commands::show_main_window,

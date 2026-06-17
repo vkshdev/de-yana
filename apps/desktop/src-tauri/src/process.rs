@@ -270,6 +270,7 @@ impl CoreProcessManager {
             snapshot.clone()
         };
 
+        let _ = write_status_snapshot(app, &snapshot);
         let _ = app.emit("core:status", snapshot);
     }
 }
@@ -333,6 +334,21 @@ fn request_clean_shutdown() {
         "POST /shutdown HTTP/1.1\r\nHost: {CORE_HOST}:{CORE_PORT}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
     );
     let _ = stream.write_all(request.as_bytes());
+}
+
+fn write_status_snapshot(app: &AppHandle, snapshot: &CoreProcessSnapshot) -> Result<(), String> {
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| error.to_string())?;
+    fs::create_dir_all(&config_dir).map_err(|error| error.to_string())?;
+
+    let path = config_dir.join("core-process-status.json");
+    let temp_path = path.with_extension("json.tmp");
+    let content = serde_json::to_string_pretty(snapshot).map_err(|error| error.to_string())?;
+
+    fs::write(&temp_path, content).map_err(|error| error.to_string())?;
+    fs::rename(temp_path, path).map_err(|error| error.to_string())
 }
 
 fn now_ms() -> u128 {

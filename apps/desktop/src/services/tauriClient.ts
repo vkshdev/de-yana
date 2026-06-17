@@ -1,6 +1,6 @@
 import {
   DEFAULT_BACKEND_PROCESS_STATUS,
-  DEFAULT_PHASE1_SETTINGS,
+  DEFAULT_DESKTOP_SETTINGS,
   type BackendProcessStatus,
   type DesktopSettings,
   type UiMode
@@ -20,13 +20,13 @@ const readBrowserSettings = (): DesktopSettings => {
     window.localStorage.getItem(legacyBrowserSettingsKey);
 
   if (!stored) {
-    return DEFAULT_PHASE1_SETTINGS;
+      return DEFAULT_DESKTOP_SETTINGS;
   }
 
   try {
-    return { ...DEFAULT_PHASE1_SETTINGS, ...JSON.parse(stored) } as DesktopSettings;
+    return { ...DEFAULT_DESKTOP_SETTINGS, ...JSON.parse(stored) } as DesktopSettings;
   } catch {
-    return DEFAULT_PHASE1_SETTINGS;
+    return DEFAULT_DESKTOP_SETTINGS;
   }
 };
 
@@ -72,10 +72,6 @@ export const tauriClient = {
     }
 
     return invoke<DesktopSettings>("get_desktop_settings");
-  },
-
-  async getPhase1Settings(): Promise<DesktopSettings> {
-    return this.getDesktopSettings();
   },
 
   async setFloatingMode(mode: UiMode): Promise<DesktopSettings> {

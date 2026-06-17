@@ -8,11 +8,6 @@ pub fn get_desktop_settings(app: AppHandle) -> settings::DesktopSettings {
 }
 
 #[tauri::command]
-pub fn get_phase1_settings(app: AppHandle) -> settings::DesktopSettings {
-    settings::read_settings(&app)
-}
-
-#[tauri::command]
 pub fn set_floating_mode(app: AppHandle, mode: String) -> Result<settings::DesktopSettings, String> {
     if mode != "compact" && mode != "expanded" {
         return Err(format!("unsupported floating mode: {mode}"));
