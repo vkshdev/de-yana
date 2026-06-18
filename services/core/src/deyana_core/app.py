@@ -9,10 +9,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
 from .api import (
+    chat_router,
+    connectors_router,
     health_router,
     lifecycle_router,
     memory_router,
+    models_router,
     onboarding_router,
+    privacy_router,
     settings_router,
     status_router,
     vault_router,
@@ -94,6 +98,10 @@ def create_app(runtime: RuntimeState | None = None) -> FastAPI:
     app.include_router(onboarding_router)
     app.include_router(vault_router)
     app.include_router(memory_router)
+    app.include_router(models_router)
+    app.include_router(chat_router)
+    app.include_router(privacy_router)
+    app.include_router(connectors_router)
     app.include_router(lifecycle_router)
     app.include_router(websocket_router)
     return app
