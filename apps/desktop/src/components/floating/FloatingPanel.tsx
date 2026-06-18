@@ -8,7 +8,10 @@ import { FloatingPrivacyBadge } from "./FloatingPrivacyBadge";
 import { FloatingStatusRing } from "./FloatingStatusRing";
 import { FloatingSyncIndicator } from "./FloatingSyncIndicator";
 import { ConnectorStatusList } from "./ConnectorStatusList";
+import { LocalChat } from "./LocalChat";
 import { MemoryBrowser } from "../memory/MemoryBrowser";
+import { ModelSetupPanel } from "./ModelSetupPanel";
+import { PrivacyAuditPanel } from "./PrivacyAuditPanel";
 import { QuickActions } from "./QuickActions";
 
 interface FloatingPanelProps {
@@ -63,26 +66,20 @@ export function FloatingPanel({ snapshot }: FloatingPanelProps) {
             backend={snapshot.backend}
             eventStreamConnected={snapshot.backendEventStreamConnected}
           />
-          <FloatingModelBadge status={snapshot.modelStatus} />
+          <FloatingModelBadge
+            status={snapshot.modelStatus}
+            modelName={snapshot.coreSettings.selectedChatModel}
+          />
           <FloatingSyncIndicator status={snapshot.syncStatus} />
         </div>
 
-        <section className="chat-surface" aria-label="Chat">
-          <article className="message message-assistant">
-            <span>
-              {snapshot.backendEventStreamConnected
-                ? "Backend core connected. Health and events are live."
-                : "Waiting for the local core event stream."}
-            </span>
-          </article>
-          <article className="message message-user">
-            <span>Keep private data local.</span>
-          </article>
-        </section>
+        <ModelSetupPanel snapshot={snapshot} />
+        <LocalChat snapshot={snapshot} />
+        <PrivacyAuditPanel snapshot={snapshot} />
 
         <QuickActions actions={snapshot.quickActions} />
         <MemoryBrowser snapshot={snapshot} />
-        <ConnectorStatusList connectors={snapshot.connectors} />
+        <ConnectorStatusList snapshot={snapshot} />
       </div>
 
       <footer className="panel-footer">

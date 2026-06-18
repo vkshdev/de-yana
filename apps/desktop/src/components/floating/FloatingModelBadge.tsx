@@ -3,10 +3,11 @@ import { Cpu } from "lucide-react";
 
 interface FloatingModelBadgeProps {
   status: ModelStatus;
+  modelName?: string;
 }
 
-export function FloatingModelBadge({ status }: FloatingModelBadgeProps) {
-  const label = status === "available" ? "qwen3 1.7B" : "Model";
+export function FloatingModelBadge({ status, modelName }: FloatingModelBadgeProps) {
+  const label = status === "available" && modelName ? shortModelName(modelName) : "Model";
 
   return (
     <div className={`status-badge model-badge model-${status}`} title="Local model status">
@@ -16,3 +17,4 @@ export function FloatingModelBadge({ status }: FloatingModelBadgeProps) {
   );
 }
 
+const shortModelName = (name: string) => name.replace(":latest", "").replace(":1.7b", " 1.7B");
