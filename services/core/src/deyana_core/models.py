@@ -125,6 +125,29 @@ class OnboardingCompleteResponse(ApiModel):
     settings: AppSettings
 
 
+class MemoryEntity(ApiModel):
+    id: str
+    memory_id: str
+    name: str
+    entity_type: str
+    source_text: str
+    created_at: str
+
+
+MemoryInsightType = Literal["action_item", "decision"]
+
+
+class MemoryInsight(ApiModel):
+    id: str
+    memory_id: str
+    type: MemoryInsightType
+    title: str
+    detail: str
+    status: str = "open"
+    due_at: str | None = None
+    created_at: str
+
+
 class MemoryItem(ApiModel):
     id: str
     type: MemoryType
@@ -137,6 +160,9 @@ class MemoryItem(ApiModel):
     source_uri: str | None = None
     importance: int = 3
     tags: list[str] = []
+    entities: list[MemoryEntity] = []
+    action_items: list[MemoryInsight] = []
+    decisions: list[MemoryInsight] = []
     created_at: str
     updated_at: str
     deleted_at: str | None = None
@@ -145,7 +171,7 @@ class MemoryItem(ApiModel):
 class MemoryCreateRequest(ApiModel):
     type: MemoryType = "note"
     title: str
-    summary: str
+    summary: str = ""
     content_markdown: str | None = None
     source_type: str = "manual"
     source_id: str | None = None
@@ -166,6 +192,14 @@ class MemoryListResponse(ApiModel):
     items: list[MemoryItem]
     total: int
     query: str | None = None
+
+
+class DailySummaryRequest(ApiModel):
+    date: str | None = None
+
+
+class ProjectSummaryRequest(ApiModel):
+    project: str
 
 
 class MemoryDeleteResponse(ApiModel):
@@ -406,6 +440,8 @@ class ConnectorItem(ApiModel):
     status: ConnectorStatus
     enabled: bool
     scopes: list[str]
+    oauth_configured: bool = False
+    real_sync_supported: bool = True
     sync_interval_minutes: int
     last_sync_at: str | None = None
     next_sync_at: str | None = None
@@ -436,6 +472,7 @@ class ConnectorOAuthStartResponse(ApiModel):
     redirect_uri: str
     expires_at: str
     mock: bool = True
+    oauth_configured: bool = False
 
 
 class ConnectorOAuthCompleteRequest(ApiModel):

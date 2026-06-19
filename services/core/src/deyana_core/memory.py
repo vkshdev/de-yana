@@ -7,13 +7,18 @@ import uuid
 from pathlib import Path
 
 from .models import (
+    DailySummaryRequest,
     MemoryCreateRequest,
+    MemoryEntity,
     MemoryExportResponse,
+    MemoryInsight,
     MemoryItem,
     MemoryListResponse,
     MemoryReindexResponse,
     MemoryUpdateRequest,
+    ProjectSummaryRequest,
 )
+from .memory_pipeline import analyze_memory, build_daily_summary, build_project_summary
 from .runtime_time import utc_timestamp
 from .storage import CoreStore, create_vault_template
 
@@ -27,6 +32,12 @@ TYPE_TO_FOLDER = {
     "file_summary": "Sources",
     "chat": "Inbox",
     "note": "Inbox",
+}
+
+CONNECTOR_SOURCE_TO_FOLDER = {
+    "gmail": "Emails",
+    "calendar": "Meetings",
+    "github": "GitHub",
 }
 
 
@@ -78,9 +89,33 @@ class MemoryStore:
                   FOREIGN KEY (memory_id) REFERENCES memory_items(id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS memory_entities (
+                  id TEXT PRIMARY KEY,
+                  memory_id TEXT NOT NULL,
+                  name TEXT NOT NULL,
+                  entity_type TEXT NOT NULL,
+                  source_text TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  FOREIGN KEY (memory_id) REFERENCES memory_items(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS memory_insights (
+                  id TEXT PRIMARY KEY,
+                  memory_id TEXT NOT NULL,
+                  type TEXT NOT NULL,
+                  title TEXT NOT NULL,
+                  detail TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'open',
+                  due_at TEXT,
+                  created_at TEXT NOT NULL,
+                  FOREIGN KEY (memory_id) REFERENCES memory_items(id) ON DELETE CASCADE
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_memory_items_deleted_at ON memory_items(deleted_at);
                 CREATE INDEX IF NOT EXISTS idx_memory_items_updated_at ON memory_items(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_memory_items_type ON memory_items(type);
+                CREATE INDEX IF NOT EXISTS idx_memory_entities_name ON memory_entities(name);
+                CREATE INDEX IF NOT EXISTS idx_memory_insights_type ON memory_insights(type);
                 """
             )
 
@@ -95,18 +130,27 @@ class MemoryStore:
         vault_root = self.require_vault_root()
         memory_id = f"memory_{uuid.uuid4().hex}"
         timestamp = utc_timestamp()
-        content_markdown = request.content_markdown or self.default_content(request.title, request.summary)
-        folder = TYPE_TO_FOLDER.get(request.type, "Inbox")
+        analysis = analyze_memory(
+            title=request.title,
+            summary=request.summary,
+            content_markdown=request.content_markdown,
+            source_type=request.source_type,
+            memory_type=request.type,
+            existing_tags=request.tags,
+            existing_importance=request.importance,
+        )
+        content_markdown = analysis.content_markdown
+        folder = folder_for_memory(request.type, request.source_type)
         markdown_path = self.markdown_path(vault_root, folder, request.title, memory_id)
         markdown_content = self.render_markdown(
             memory_id=memory_id,
             memory_type=request.type,
             title=request.title,
-            summary=request.summary,
+            summary=analysis.summary,
             content_markdown=content_markdown,
             source_type=request.source_type,
             source_uri=request.source_uri,
-            tags=request.tags,
+            tags=list(analysis.tags),
             created_at=timestamp,
             updated_at=timestamp,
         )
@@ -128,19 +172,26 @@ class MemoryStore:
                         memory_id,
                         request.type,
                         request.title,
-                        request.summary,
+                        analysis.summary,
                         content_markdown,
                         str(markdown_path),
                         request.source_type,
                         request.source_id,
                         request.source_uri,
-                        request.importance,
+                        analysis.importance,
                         timestamp,
                         timestamp,
                     ),
                 )
-                self.replace_tags(connection, memory_id, request.tags)
+                self.replace_tags(connection, memory_id, list(analysis.tags))
                 self.replace_chunks(connection, memory_id, content_markdown, timestamp)
+                self.replace_entities(connection, memory_id, analysis.entities, timestamp)
+                self.replace_insights(
+                    connection,
+                    memory_id,
+                    [*analysis.action_items, *analysis.decisions],
+                    timestamp,
+                )
 
         return self.get(memory_id)
 
@@ -160,10 +211,17 @@ class MemoryStore:
                 OR id IN (
                   SELECT memory_id FROM memory_tags WHERE lower(tag) LIKE ?
                 )
+                OR id IN (
+                  SELECT memory_id FROM memory_entities WHERE lower(name) LIKE ?
+                )
+                OR id IN (
+                  SELECT memory_id FROM memory_insights
+                  WHERE lower(title) LIKE ? OR lower(detail) LIKE ?
+                )
               )
             """
             pattern = f"%{query_value.lower()}%"
-            params.extend([pattern, pattern, pattern, pattern])
+            params.extend([pattern, pattern, pattern, pattern, pattern, pattern, pattern])
 
         with self.connect() as connection:
             rows = connection.execute(
@@ -209,6 +267,19 @@ class MemoryStore:
         )
         importance = request.importance if request.importance is not None else current.importance
         tags = request.tags if request.tags is not None else current.tags
+        analysis = analyze_memory(
+            title=title,
+            summary=summary,
+            content_markdown=content_markdown,
+            source_type=current.source_type,
+            memory_type=current.type,
+            existing_tags=tags,
+            existing_importance=importance,
+        )
+        summary = analysis.summary
+        content_markdown = analysis.content_markdown
+        importance = analysis.importance
+        tags = list(analysis.tags)
         markdown_path = Path(current.markdown_path) if current.markdown_path else None
 
         if markdown_path:
@@ -239,6 +310,13 @@ class MemoryStore:
                 )
                 self.replace_tags(connection, memory_id, tags)
                 self.replace_chunks(connection, memory_id, content_markdown, timestamp)
+                self.replace_entities(connection, memory_id, analysis.entities, timestamp)
+                self.replace_insights(
+                    connection,
+                    memory_id,
+                    [*analysis.action_items, *analysis.decisions],
+                    timestamp,
+                )
 
         return self.get(memory_id)
 
@@ -254,6 +332,8 @@ class MemoryStore:
                 )
                 connection.execute("DELETE FROM memory_tags WHERE memory_id = ?", (memory_id,))
                 connection.execute("DELETE FROM memory_chunks WHERE memory_id = ?", (memory_id,))
+                connection.execute("DELETE FROM memory_entities WHERE memory_id = ?", (memory_id,))
+                connection.execute("DELETE FROM memory_insights WHERE memory_id = ?", (memory_id,))
 
         if current.markdown_path:
             try:
@@ -283,15 +363,46 @@ class MemoryStore:
 
                     content = path.read_text(encoding="utf-8")
                     title, summary, body = parse_markdown(content, fallback_title=row["title"])
+                    existing_tags = [
+                        tag_row["tag"]
+                        for tag_row in connection.execute(
+                            "SELECT tag FROM memory_tags WHERE memory_id = ?",
+                            (row["id"],),
+                        ).fetchall()
+                    ]
+                    analysis = analyze_memory(
+                        title=title,
+                        summary=summary,
+                        content_markdown=body,
+                        source_type=row["source_type"],
+                        memory_type=row["type"],
+                        existing_tags=existing_tags,
+                        existing_importance=row["importance"],
+                    )
                     connection.execute(
                         """
                         UPDATE memory_items
-                        SET title = ?, summary = ?, content_markdown = ?, updated_at = ?
+                        SET title = ?, summary = ?, content_markdown = ?, importance = ?, updated_at = ?
                         WHERE id = ?
                         """,
-                        (title, summary, body, timestamp, row["id"]),
+                        (
+                            title,
+                            analysis.summary,
+                            analysis.content_markdown,
+                            analysis.importance,
+                            timestamp,
+                            row["id"],
+                        ),
                     )
-                    self.replace_chunks(connection, row["id"], body, timestamp)
+                    self.replace_tags(connection, row["id"], list(analysis.tags))
+                    self.replace_chunks(connection, row["id"], analysis.content_markdown, timestamp)
+                    self.replace_entities(connection, row["id"], analysis.entities, timestamp)
+                    self.replace_insights(
+                        connection,
+                        row["id"],
+                        [*analysis.action_items, *analysis.decisions],
+                        timestamp,
+                    )
                     reindexed += 1
 
         return MemoryReindexResponse(reindexed=reindexed, missing_markdown=missing_markdown)
@@ -310,6 +421,65 @@ class MemoryStore:
             exported_at=utc_timestamp(),
             items=[self.row_to_item(row) for row in rows],
         )
+
+    def generate_daily_summary(self, request: DailySummaryRequest) -> MemoryItem:
+        target_date = request.date or utc_timestamp()[:10]
+        items = self.items_for_date(target_date)
+        title, summary, content, tags = build_daily_summary(target_date, items)
+        existing = self.find_by_source("memory_pipeline_daily", target_date)
+        payload = MemoryCreateRequest(
+            type="daily_summary",
+            title=title,
+            summary=summary,
+            content_markdown=content,
+            source_type="memory_pipeline_daily",
+            source_id=target_date,
+            importance=4 if items else 2,
+            tags=tags,
+        )
+        if existing:
+            return self.update(
+                existing.id,
+                MemoryUpdateRequest(
+                    title=payload.title,
+                    summary=payload.summary,
+                    content_markdown=payload.content_markdown,
+                    importance=payload.importance,
+                    tags=payload.tags,
+                ),
+            )
+        return self.create(payload)
+
+    def generate_project_summary(self, request: ProjectSummaryRequest) -> MemoryItem:
+        project = request.project.strip()
+        if not project:
+            raise ValueError("Project name is required.")
+        items = self.items_for_project(project)
+        title, summary, content, tags = build_project_summary(project, items)
+        source_id = slugify(project) or project
+        existing = self.find_by_source("memory_pipeline_project", source_id)
+        payload = MemoryCreateRequest(
+            type="project_summary",
+            title=title,
+            summary=summary,
+            content_markdown=content,
+            source_type="memory_pipeline_project",
+            source_id=source_id,
+            importance=4 if items else 2,
+            tags=tags,
+        )
+        if existing:
+            return self.update(
+                existing.id,
+                MemoryUpdateRequest(
+                    title=payload.title,
+                    summary=payload.summary,
+                    content_markdown=payload.content_markdown,
+                    importance=payload.importance,
+                    tags=payload.tags,
+                ),
+            )
+        return self.create(payload)
 
     def row_to_item(self, row: sqlite3.Row, read_markdown: bool = False) -> MemoryItem:
         content_markdown = row["content_markdown"]
@@ -335,6 +505,9 @@ class MemoryStore:
             source_uri=row["source_uri"],
             importance=row["importance"],
             tags=self.tags_for(row["id"]),
+            entities=self.entities_for(row["id"]),
+            action_items=self.insights_for(row["id"], "action_item"),
+            decisions=self.insights_for(row["id"], "decision"),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             deleted_at=row["deleted_at"],
@@ -347,6 +520,111 @@ class MemoryStore:
                 (memory_id,),
             ).fetchall()
         return [row["tag"] for row in rows]
+
+    def entities_for(self, memory_id: str) -> list[MemoryEntity]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_entities
+                WHERE memory_id = ?
+                ORDER BY entity_type, name
+                """,
+                (memory_id,),
+            ).fetchall()
+        return [
+            MemoryEntity(
+                id=row["id"],
+                memory_id=row["memory_id"],
+                name=row["name"],
+                entity_type=row["entity_type"],
+                source_text=row["source_text"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    def insights_for(self, memory_id: str, insight_type: str) -> list[MemoryInsight]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_insights
+                WHERE memory_id = ? AND type = ?
+                ORDER BY created_at, title
+                """,
+                (memory_id, insight_type),
+            ).fetchall()
+        return [
+            MemoryInsight(
+                id=row["id"],
+                memory_id=row["memory_id"],
+                type=row["type"],
+                title=row["title"],
+                detail=row["detail"],
+                status=row["status"],
+                due_at=row["due_at"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    def items_for_date(self, target_date: str) -> list[MemoryItem]:
+        self.initialize()
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_items
+                WHERE deleted_at IS NULL
+                  AND created_at LIKE ?
+                  AND type != 'daily_summary'
+                ORDER BY updated_at DESC
+                LIMIT 80
+                """,
+                (f"{target_date}%",),
+            ).fetchall()
+        return [self.row_to_item(row) for row in rows]
+
+    def items_for_project(self, project: str) -> list[MemoryItem]:
+        self.initialize()
+        pattern = f"%{project.strip().lower()}%"
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_items
+                WHERE deleted_at IS NULL
+                  AND type != 'project_summary'
+                  AND (
+                    lower(title) LIKE ?
+                    OR lower(summary) LIKE ?
+                    OR lower(content_markdown) LIKE ?
+                    OR id IN (
+                      SELECT memory_id FROM memory_tags WHERE lower(tag) LIKE ?
+                    )
+                    OR id IN (
+                      SELECT memory_id FROM memory_entities WHERE lower(name) LIKE ?
+                    )
+                  )
+                ORDER BY updated_at DESC
+                LIMIT 100
+                """,
+                (pattern, pattern, pattern, pattern, pattern),
+            ).fetchall()
+        return [self.row_to_item(row) for row in rows]
+
+    def find_by_source(self, source_type: str, source_id: str) -> MemoryItem | None:
+        self.initialize()
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM memory_items
+                WHERE deleted_at IS NULL
+                  AND source_type = ?
+                  AND source_id = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (source_type, source_id),
+            ).fetchone()
+        return self.row_to_item(row) if row else None
 
     def require_vault_root(self) -> Path:
         settings = self.core_store.read_settings()
@@ -428,10 +706,69 @@ class MemoryStore:
                 ),
             )
 
+    @staticmethod
+    def replace_entities(
+        connection: sqlite3.Connection,
+        memory_id: str,
+        entities,
+        created_at: str,
+    ) -> None:
+        connection.execute("DELETE FROM memory_entities WHERE memory_id = ?", (memory_id,))
+        for entity in entities:
+            connection.execute(
+                """
+                INSERT INTO memory_entities (
+                  id, memory_id, name, entity_type, source_text, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"entity_{uuid.uuid4().hex}",
+                    memory_id,
+                    entity.name,
+                    entity.entity_type,
+                    entity.source_text,
+                    created_at,
+                ),
+            )
+
+    @staticmethod
+    def replace_insights(
+        connection: sqlite3.Connection,
+        memory_id: str,
+        insights,
+        created_at: str,
+    ) -> None:
+        connection.execute("DELETE FROM memory_insights WHERE memory_id = ?", (memory_id,))
+        for insight in insights:
+            connection.execute(
+                """
+                INSERT INTO memory_insights (
+                  id, memory_id, type, title, detail, status, due_at, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'open', ?, ?)
+                """,
+                (
+                    f"insight_{uuid.uuid4().hex}",
+                    memory_id,
+                    insight.insight_type,
+                    insight.title,
+                    insight.detail,
+                    insight.due_at,
+                    created_at,
+                ),
+            )
+
 
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug[:72]
+
+
+def folder_for_memory(memory_type: str, source_type: str) -> str:
+    if memory_type == "connector_summary":
+        return CONNECTOR_SOURCE_TO_FOLDER.get(source_type, TYPE_TO_FOLDER["connector_summary"])
+    return TYPE_TO_FOLDER.get(memory_type, "Inbox")
 
 
 def chunk_text(content: str, size: int = 900) -> list[str]:

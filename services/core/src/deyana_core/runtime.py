@@ -36,7 +36,7 @@ class RuntimeState:
         self.chat_agent = ChatAgent(self.memory_store, self.chat_store, self.model_router)
         self.privacy_firewall = PrivacyFirewall(settings.data_dir, self.store)
         self.privacy_firewall.initialize()
-        self.connector_manager = ConnectorManager(settings.data_dir, self.privacy_firewall)
+        self.connector_manager = ConnectorManager(settings.data_dir, self.privacy_firewall, self.memory_store)
         self.connector_manager.initialize()
 
     @property

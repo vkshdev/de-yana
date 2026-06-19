@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlencode
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
 
+from .memory import MemoryStore
 from .models import (
     ConnectorItem,
     ConnectorListResponse,
@@ -17,6 +22,7 @@ from .models import (
     ConnectorSyncRunsResponse,
     ConnectorSyncRunStatus,
     ConnectorStatus,
+    MemoryCreateRequest,
     PrivacyCheckRequest,
     PrivacyCheckResponse,
 )
@@ -40,10 +46,26 @@ class ConnectorStateError(ConnectorError):
     pass
 
 
+class ConnectorHttpError(ConnectorError):
+    pass
+
+
+@dataclass(frozen=True)
+class ConnectorRecord:
+    external_id: str
+    title: str
+    summary: str
+    content_markdown: str
+    source_uri: str | None
+    item_timestamp: str | None
+    tags: tuple[str, ...]
+    normalized: dict[str, object]
+
+
 @dataclass(frozen=True)
 class ConnectorSyncResult:
     items_seen: int
-    items_written: int
+    records: tuple[ConnectorRecord, ...]
     detail: str
 
 
@@ -54,8 +76,19 @@ class ConnectorDefinition:
     scopes: tuple[str, ...]
     authorization_url: str
     token_url: str
-    api_probe_url: str
+    api_base_url: str
+    api_probe_path: str
+    client_id_env: str | None
+    client_secret_env: str | None
+    token_url_env: str | None
+    api_base_url_env: str | None
     default_sync_interval_minutes: int = DEFAULT_SYNC_INTERVAL_MINUTES
+
+
+@dataclass(frozen=True)
+class ConnectorSyncContext:
+    token: dict[str, object]
+    http_client: "ConnectorHttpClient"
 
 
 class BaseConnector:
@@ -73,10 +106,37 @@ class BaseConnector:
     def scopes(self) -> list[str]:
         return list(self.definition.scopes)
 
+    def oauth_configured(self) -> bool:
+        return bool(self.oauth_client_id() and self.oauth_client_secret())
+
+    def oauth_client_id(self) -> str | None:
+        if not self.definition.client_id_env:
+            return None
+        return os.getenv(self.definition.client_id_env)
+
+    def oauth_client_secret(self) -> str | None:
+        if not self.definition.client_secret_env:
+            return None
+        return os.getenv(self.definition.client_secret_env)
+
+    def token_url(self) -> str:
+        if self.definition.token_url_env:
+            return os.getenv(self.definition.token_url_env, self.definition.token_url)
+        return self.definition.token_url
+
+    def api_base_url(self) -> str:
+        if self.definition.api_base_url_env:
+            return os.getenv(self.definition.api_base_url_env, self.definition.api_base_url).rstrip("/")
+        return self.definition.api_base_url.rstrip("/")
+
+    def api_probe_url(self) -> str:
+        return f"{self.api_base_url()}{self.definition.api_probe_path}"
+
     def build_authorization_url(self, *, state: str, redirect_uri: str) -> str:
+        client_id = self.oauth_client_id() or "deyana-local-mock"
         query = urlencode(
             {
-                "client_id": "deyana-local-mock",
+                "client_id": client_id,
                 "redirect_uri": redirect_uri,
                 "response_type": "code",
                 "scope": " ".join(self.definition.scopes),
@@ -86,6 +146,37 @@ class BaseConnector:
             }
         )
         return f"{self.definition.authorization_url}?{query}"
+
+    def exchange_oauth_code(
+        self,
+        *,
+        code: str,
+        redirect_uri: str,
+        issued_at: str,
+        http_client: "ConnectorHttpClient",
+        user_approved: bool,
+    ) -> dict[str, object]:
+        client_id = self.oauth_client_id()
+        client_secret = self.oauth_client_secret()
+        if not client_id or not client_secret:
+            return self.create_mock_token(code=code, issued_at=issued_at)
+
+        response = http_client.post_form(
+            self.token_url(),
+            {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            },
+            purpose="oauth_api_fetch",
+            data_category="oauth_token",
+            payload_preview=f"{self.name} OAuth code exchange",
+            user_approved=user_approved,
+            headers={"accept": "application/json"},
+        )
+        return self.token_payload_from_response(response, issued_at=issued_at)
 
     def create_mock_token(self, *, code: str, issued_at: str) -> dict[str, object]:
         _ = code
@@ -101,15 +192,171 @@ class BaseConnector:
             "mock": True,
         }
 
-    def sync(self, token: dict[str, object]) -> ConnectorSyncResult:
+    def token_payload_from_response(self, response: dict[str, object], *, issued_at: str) -> dict[str, object]:
+        access_token = response.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise ConnectorStateError("OAuth provider did not return an access token.")
+
+        expires_in = response.get("expires_in")
+        expires_at = None
+        if isinstance(expires_in, int):
+            expires_at = (datetime.now(UTC) + timedelta(seconds=expires_in)).isoformat().replace("+00:00", "Z")
+
+        return {
+            "schemaVersion": 1,
+            "connectorId": self.id,
+            "accessToken": access_token,
+            "refreshToken": response.get("refresh_token"),
+            "tokenType": response.get("token_type", "Bearer"),
+            "scopes": response.get("scope", " ".join(self.scopes)),
+            "issuedAt": issued_at,
+            "expiresAt": expires_at,
+            "mock": False,
+        }
+
+    def sync(self, context: ConnectorSyncContext) -> ConnectorSyncResult:
+        self.validate_token(context.token)
+        if context.token.get("mock"):
+            return ConnectorSyncResult(
+                items_seen=0,
+                records=(),
+                detail="Mock connector token is connected; configure real OAuth credentials to fetch live data.",
+            )
+        raise ConnectorStateError(f"{self.name} real sync is not implemented.")
+
+    def validate_token(self, token: dict[str, object]) -> None:
         if token.get("connectorId") != self.id:
             raise ConnectorStateError("Stored token belongs to a different connector.")
-        return ConnectorSyncResult(items_seen=0, items_written=0, detail="Mock connector sync completed.")
 
 
-class MockConnector(BaseConnector):
+class GmailConnector(BaseConnector):
     def __init__(self, definition: ConnectorDefinition) -> None:
         self.definition = definition
+
+    def sync(self, context: ConnectorSyncContext) -> ConnectorSyncResult:
+        if context.token.get("mock"):
+            return super().sync(context)
+        self.validate_token(context.token)
+        base_url = self.api_base_url()
+        list_url = f"{base_url}/users/me/messages?{urlencode({'maxResults': 10})}"
+        listing = context.http_client.get_json(
+            list_url,
+            token=context.token,
+            payload_preview="Gmail message metadata list",
+        )
+        messages = listing.get("messages") if isinstance(listing, dict) else []
+        records: list[ConnectorRecord] = []
+        for message in messages if isinstance(messages, list) else []:
+            message_id = message.get("id") if isinstance(message, dict) else None
+            if not isinstance(message_id, str) or not message_id:
+                continue
+            query = urlencode(
+                {
+                    "format": "metadata",
+                    "metadataHeaders": ["From", "Subject", "Date"],
+                },
+                doseq=True,
+            )
+            detail = context.http_client.get_json(
+                f"{base_url}/users/me/messages/{quote(message_id, safe='')}?{query}",
+                token=context.token,
+                payload_preview="Gmail message metadata detail",
+            )
+            records.append(gmail_record(detail, message_id))
+        return ConnectorSyncResult(items_seen=len(records), records=tuple(records), detail="Gmail metadata synced.")
+
+
+class CalendarConnector(BaseConnector):
+    def __init__(self, definition: ConnectorDefinition) -> None:
+        self.definition = definition
+
+    def sync(self, context: ConnectorSyncContext) -> ConnectorSyncResult:
+        if context.token.get("mock"):
+            return super().sync(context)
+        self.validate_token(context.token)
+        time_min = (datetime.now(UTC) - timedelta(days=1)).isoformat().replace("+00:00", "Z")
+        query = urlencode(
+            {
+                "maxResults": 20,
+                "singleEvents": "true",
+                "orderBy": "startTime",
+                "timeMin": time_min,
+            }
+        )
+        response = context.http_client.get_json(
+            f"{self.api_base_url()}/calendars/primary/events?{query}",
+            token=context.token,
+            payload_preview="Calendar event metadata list",
+        )
+        items = response.get("items") if isinstance(response, dict) else []
+        records = [
+            calendar_record(item)
+            for item in items
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        ]
+        return ConnectorSyncResult(
+            items_seen=len(records),
+            records=tuple(records),
+            detail="Google Calendar events synced.",
+        )
+
+
+class GitHubConnector(BaseConnector):
+    def __init__(self, definition: ConnectorDefinition) -> None:
+        self.definition = definition
+
+    def exchange_oauth_code(
+        self,
+        *,
+        code: str,
+        redirect_uri: str,
+        issued_at: str,
+        http_client: "ConnectorHttpClient",
+        user_approved: bool,
+    ) -> dict[str, object]:
+        client_id = self.oauth_client_id()
+        client_secret = self.oauth_client_secret()
+        if not client_id or not client_secret:
+            return self.create_mock_token(code=code, issued_at=issued_at)
+
+        response = http_client.post_form(
+            self.token_url(),
+            {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+            purpose="oauth_api_fetch",
+            data_category="oauth_token",
+            payload_preview="GitHub OAuth code exchange",
+            user_approved=user_approved,
+            headers={"accept": "application/json"},
+        )
+        return self.token_payload_from_response(response, issued_at=issued_at)
+
+    def sync(self, context: ConnectorSyncContext) -> ConnectorSyncResult:
+        if context.token.get("mock"):
+            return super().sync(context)
+        self.validate_token(context.token)
+        query = urlencode({"per_page": 20, "sort": "updated", "direction": "desc"})
+        response = context.http_client.get_json(
+            f"{self.api_base_url()}/user/repos?{query}",
+            token=context.token,
+            payload_preview="GitHub repository metadata list",
+            headers={"accept": "application/vnd.github+json"},
+        )
+        repos = response if isinstance(response, list) else response.get("items", [])
+        records = [
+            github_record(repo)
+            for repo in repos
+            if isinstance(repo, dict) and (repo.get("id") or repo.get("full_name"))
+        ]
+        return ConnectorSyncResult(
+            items_seen=len(records),
+            records=tuple(records),
+            detail="GitHub repositories synced.",
+        )
 
 
 CONNECTOR_DEFINITIONS = [
@@ -119,7 +366,12 @@ CONNECTOR_DEFINITIONS = [
         scopes=("https://www.googleapis.com/auth/gmail.readonly",),
         authorization_url="https://accounts.google.com/o/oauth2/v2/auth",
         token_url="https://oauth2.googleapis.com/token",
-        api_probe_url="https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        api_base_url="https://gmail.googleapis.com/gmail/v1",
+        api_probe_path="/users/me/messages",
+        client_id_env="DEYANA_GOOGLE_OAUTH_CLIENT_ID",
+        client_secret_env="DEYANA_GOOGLE_OAUTH_CLIENT_SECRET",
+        token_url_env="DEYANA_GOOGLE_OAUTH_TOKEN_URL",
+        api_base_url_env="DEYANA_GMAIL_API_BASE_URL",
     ),
     ConnectorDefinition(
         id="calendar",
@@ -127,7 +379,12 @@ CONNECTOR_DEFINITIONS = [
         scopes=("https://www.googleapis.com/auth/calendar.readonly",),
         authorization_url="https://accounts.google.com/o/oauth2/v2/auth",
         token_url="https://oauth2.googleapis.com/token",
-        api_probe_url="https://calendar-json.googleapis.com/calendar/v3/users/me/calendarList",
+        api_base_url="https://www.googleapis.com/calendar/v3",
+        api_probe_path="/calendars/primary/events",
+        client_id_env="DEYANA_GOOGLE_OAUTH_CLIENT_ID",
+        client_secret_env="DEYANA_GOOGLE_OAUTH_CLIENT_SECRET",
+        token_url_env="DEYANA_GOOGLE_OAUTH_TOKEN_URL",
+        api_base_url_env="DEYANA_CALENDAR_API_BASE_URL",
     ),
     ConnectorDefinition(
         id="github",
@@ -135,9 +392,278 @@ CONNECTOR_DEFINITIONS = [
         scopes=("read:user", "repo"),
         authorization_url="https://github.com/login/oauth/authorize",
         token_url="https://github.com/login/oauth/access_token",
-        api_probe_url="https://api.github.com/user/repos",
+        api_base_url="https://api.github.com",
+        api_probe_path="/user/repos",
+        client_id_env="DEYANA_GITHUB_OAUTH_CLIENT_ID",
+        client_secret_env="DEYANA_GITHUB_OAUTH_CLIENT_SECRET",
+        token_url_env="DEYANA_GITHUB_OAUTH_TOKEN_URL",
+        api_base_url_env="DEYANA_GITHUB_API_BASE_URL",
     ),
 ]
+
+
+CONNECTOR_CLASSES = {
+    "gmail": GmailConnector,
+    "calendar": CalendarConnector,
+    "github": GitHubConnector,
+}
+
+
+class ConnectorHttpClient:
+    def __init__(self, privacy_firewall: PrivacyFirewall, connector_id: str) -> None:
+        self.privacy_firewall = privacy_firewall
+        self.connector_id = connector_id
+        self.privacy_results: list[PrivacyCheckResponse] = []
+
+    def get_json(
+        self,
+        url: str,
+        *,
+        token: dict[str, object],
+        payload_preview: str,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any] | list[Any]:
+        request_headers = {
+            "accept": "application/json",
+            "authorization": f"Bearer {token.get('accessToken', '')}",
+            **(headers or {}),
+        }
+        return self._request_json(
+            "GET",
+            url,
+            purpose="connector_api_fetch",
+            data_category="connector_metadata",
+            payload_preview=payload_preview,
+            user_approved=True,
+            headers=request_headers,
+        )
+
+    def post_form(
+        self,
+        url: str,
+        data: dict[str, object],
+        *,
+        purpose: str,
+        data_category: str,
+        payload_preview: str,
+        user_approved: bool,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        body = urlencode(data).encode("utf-8")
+        response = self._request_json(
+            "POST",
+            url,
+            body=body,
+            purpose=purpose,
+            data_category=data_category,
+            payload_preview=payload_preview,
+            user_approved=user_approved,
+            headers={
+                "content-type": "application/x-www-form-urlencoded",
+                "accept": "application/json",
+                **(headers or {}),
+            },
+        )
+        if not isinstance(response, dict):
+            raise ConnectorHttpError("OAuth provider returned an invalid response.")
+        return response
+
+    def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        purpose: str,
+        data_category: str,
+        payload_preview: str,
+        user_approved: bool,
+        headers: dict[str, str],
+        body: bytes | None = None,
+    ) -> dict[str, Any] | list[Any]:
+        privacy_result = self.privacy_firewall.check(
+            PrivacyCheckRequest(
+                url=url,
+                method=method,
+                purpose=purpose,
+                data_category=data_category,
+                payload_preview=payload_preview,
+                user_approved=user_approved,
+                connector_id=self.connector_id,
+            )
+        )
+        self.privacy_results.append(privacy_result)
+        if not privacy_result.allowed:
+            raise PrivacyPolicyError(privacy_result)
+
+        request = Request(url, data=body, headers=headers, method=method)
+        try:
+            with urlopen(request, timeout=20) as response:
+                raw_body = response.read().decode("utf-8")
+        except HTTPError as error:
+            raise ConnectorHttpError(f"Connector request failed with HTTP {error.code}.") from error
+        except URLError as error:
+            raise ConnectorHttpError(f"Connector request failed: {error.reason}") from error
+
+        if not raw_body:
+            return {}
+        try:
+            parsed = json.loads(raw_body)
+        except json.JSONDecodeError as error:
+            raise ConnectorHttpError("Connector returned invalid JSON.") from error
+        if not isinstance(parsed, (dict, list)):
+            raise ConnectorHttpError("Connector returned an unsupported JSON payload.")
+        return parsed
+
+
+def gmail_record(payload: dict[str, Any], fallback_id: str) -> ConnectorRecord:
+    message_id = str(payload.get("id") or fallback_id)
+    headers = headers_by_name(payload)
+    subject = headers.get("subject") or f"Gmail message {message_id}"
+    sender = headers.get("from") or "Unknown sender"
+    sent_at = headers.get("date")
+    snippet = str(payload.get("snippet") or "").strip()
+    summary = compact_sentence(f"Email from {sender}: {subject}. {snippet}")
+    content = "\n".join(
+        [
+            "## Gmail summary",
+            "",
+            f"- From: {sender}",
+            f"- Subject: {subject}",
+            f"- Date: {sent_at or 'Unknown'}",
+            f"- Message ID: {message_id}",
+            "",
+            snippet or "No snippet was returned by Gmail metadata sync.",
+        ]
+    )
+    return ConnectorRecord(
+        external_id=message_id,
+        title=f"Gmail: {subject}",
+        summary=summary,
+        content_markdown=content,
+        source_uri=f"https://mail.google.com/mail/u/0/#all/{message_id}",
+        item_timestamp=sent_at,
+        tags=("connector", "gmail", "email"),
+        normalized={
+            "messageId": message_id,
+            "from": sender,
+            "subject": subject,
+            "date": sent_at,
+            "snippet": snippet,
+        },
+    )
+
+
+def calendar_record(payload: dict[str, Any]) -> ConnectorRecord:
+    event_id = str(payload["id"])
+    title = str(payload.get("summary") or f"Calendar event {event_id}")
+    start = event_time(payload.get("start"))
+    end = event_time(payload.get("end"))
+    location = str(payload.get("location") or "").strip()
+    description = str(payload.get("description") or "").strip()
+    summary = compact_sentence(
+        f"Calendar event {title} starts {start or 'at an unknown time'}"
+        + (f" at {location}." if location else ".")
+    )
+    content_lines = [
+        "## Calendar summary",
+        "",
+        f"- Event: {title}",
+        f"- Start: {start or 'Unknown'}",
+        f"- End: {end or 'Unknown'}",
+        f"- Location: {location or 'Not provided'}",
+    ]
+    if description:
+        content_lines.extend(["", description])
+    return ConnectorRecord(
+        external_id=event_id,
+        title=f"Calendar: {title}",
+        summary=summary,
+        content_markdown="\n".join(content_lines),
+        source_uri=payload.get("htmlLink") if isinstance(payload.get("htmlLink"), str) else None,
+        item_timestamp=start,
+        tags=("connector", "calendar", "event"),
+        normalized={
+            "eventId": event_id,
+            "summary": title,
+            "start": start,
+            "end": end,
+            "location": location,
+        },
+    )
+
+
+def github_record(payload: dict[str, Any]) -> ConnectorRecord:
+    external_id = str(payload.get("id") or payload.get("full_name"))
+    full_name = str(payload.get("full_name") or payload.get("name") or external_id)
+    description = str(payload.get("description") or "").strip()
+    language = str(payload.get("language") or "").strip()
+    updated_at = payload.get("updated_at") if isinstance(payload.get("updated_at"), str) else None
+    visibility = "private" if payload.get("private") else "public"
+    summary = compact_sentence(
+        f"GitHub repository {full_name} is {visibility}"
+        + (f", uses {language}" if language else "")
+        + (f", and was updated {updated_at}" if updated_at else "")
+        + "."
+    )
+    content = "\n".join(
+        [
+            "## GitHub repository summary",
+            "",
+            f"- Repository: {full_name}",
+            f"- Visibility: {visibility}",
+            f"- Language: {language or 'Not detected'}",
+            f"- Updated: {updated_at or 'Unknown'}",
+            "",
+            description or "No repository description was provided.",
+        ]
+    )
+    return ConnectorRecord(
+        external_id=external_id,
+        title=f"GitHub: {full_name}",
+        summary=summary,
+        content_markdown=content,
+        source_uri=payload.get("html_url") if isinstance(payload.get("html_url"), str) else None,
+        item_timestamp=updated_at,
+        tags=("connector", "github", "repository"),
+        normalized={
+            "repositoryId": external_id,
+            "fullName": full_name,
+            "private": bool(payload.get("private")),
+            "language": language,
+            "updatedAt": updated_at,
+        },
+    )
+
+
+def headers_by_name(payload: dict[str, Any]) -> dict[str, str]:
+    envelope = payload.get("payload")
+    raw_headers = envelope.get("headers") if isinstance(envelope, dict) else []
+    headers: dict[str, str] = {}
+    for header in raw_headers if isinstance(raw_headers, list) else []:
+        if not isinstance(header, dict):
+            continue
+        name = header.get("name")
+        value = header.get("value")
+        if isinstance(name, str) and isinstance(value, str):
+            headers[name.lower()] = value
+    return headers
+
+
+def event_time(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    for key in ("dateTime", "date"):
+        item = value.get(key)
+        if isinstance(item, str):
+            return item
+    return None
+
+
+def compact_sentence(value: str, limit: int = 220) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1].rstrip() + "."
 
 
 class ConnectorScheduler:
@@ -155,13 +681,17 @@ class ConnectorScheduler:
 
 
 class ConnectorManager:
-    def __init__(self, data_dir: Path, privacy_firewall: PrivacyFirewall) -> None:
+    def __init__(self, data_dir: Path, privacy_firewall: PrivacyFirewall, memory_store: MemoryStore) -> None:
         self.data_dir = data_dir
         self.database_path = data_dir / "connectors.sqlite3"
         self.privacy_firewall = privacy_firewall
+        self.memory_store = memory_store
         self.token_vault = TokenVault(data_dir, self.database_path)
         self.scheduler = ConnectorScheduler()
-        self.registry = {definition.id: MockConnector(definition) for definition in CONNECTOR_DEFINITIONS}
+        self.registry = {
+            definition.id: CONNECTOR_CLASSES[definition.id](definition)
+            for definition in CONNECTOR_DEFINITIONS
+        }
 
     def initialize(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -206,8 +736,25 @@ class ConnectorManager:
                   error_message TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS connector_items (
+                  id TEXT PRIMARY KEY,
+                  connector_id TEXT NOT NULL,
+                  external_id TEXT NOT NULL,
+                  title TEXT NOT NULL,
+                  summary TEXT NOT NULL,
+                  source_uri TEXT,
+                  item_timestamp TEXT,
+                  normalized_json TEXT NOT NULL,
+                  memory_id TEXT NOT NULL,
+                  fetched_at TEXT NOT NULL,
+                  UNIQUE(connector_id, external_id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_connector_sync_runs_started_at
                 ON connector_sync_runs(started_at);
+
+                CREATE INDEX IF NOT EXISTS idx_connector_items_connector_id
+                ON connector_items(connector_id);
                 """
             )
 
@@ -332,7 +879,8 @@ class ConnectorManager:
             scopes=connector.scopes,
             redirect_uri=redirect,
             expires_at=expires_at,
-            mock=True,
+            mock=not connector.oauth_configured(),
+            oauth_configured=connector.oauth_configured(),
         )
 
     def complete_oauth(
@@ -345,22 +893,32 @@ class ConnectorManager:
     ) -> tuple[ConnectorItem, PrivacyCheckResponse]:
         connector = self._registered_connector(connector_id)
         oauth_state = self._consume_oauth_state(connector_id, state)
-        privacy_result = self.privacy_firewall.check(
-            PrivacyCheckRequest(
-                url=connector.definition.token_url,
-                method="POST",
-                purpose="oauth_api_fetch",
-                data_category="oauth_token",
-                payload_preview=f"{connector.name} OAuth token exchange",
-                user_approved=user_approved,
-                connector_id=connector_id,
-            )
-        )
-        if not privacy_result.allowed:
-            raise PrivacyPolicyError(privacy_result)
-
         issued_at = utc_timestamp()
-        token_payload = connector.create_mock_token(code=code, issued_at=issued_at)
+        http_client = ConnectorHttpClient(self.privacy_firewall, connector_id)
+        if not connector.oauth_configured():
+            privacy_result = self.privacy_firewall.check(
+                PrivacyCheckRequest(
+                    url=connector.token_url(),
+                    method="POST",
+                    purpose="oauth_api_fetch",
+                    data_category="oauth_token",
+                    payload_preview=f"{connector.name} mock OAuth token exchange",
+                    user_approved=user_approved,
+                    connector_id=connector_id,
+                )
+            )
+            if not privacy_result.allowed:
+                raise PrivacyPolicyError(privacy_result)
+            token_payload = connector.create_mock_token(code=code, issued_at=issued_at)
+        else:
+            token_payload = connector.exchange_oauth_code(
+                code=code,
+                redirect_uri=oauth_state["redirect_uri"],
+                issued_at=issued_at,
+                http_client=http_client,
+                user_approved=user_approved,
+            )
+            privacy_result = http_client.privacy_results[-1]
         token_updated_at = self.token_vault.store(connector_id, token_payload)
         current = self.get_connector(connector_id)
         next_sync_at = self.scheduler.next_sync_at(
@@ -439,10 +997,17 @@ class ConnectorManager:
             run = self._complete_sync_run(run_id, status="failed", error_message="Connector token is missing.")
             self._set_connector_error(connector_id, "Connector token is missing.")
             raise ConnectorStateError("Connector token is missing.")
+        if not token.get("mock"):
+            try:
+                self.memory_store.require_vault_root()
+            except ValueError as error:
+                run = self._complete_sync_run(run_id, status="failed", error_message=str(error))
+                self._set_connector_error(connector_id, str(error))
+                return ConnectorSyncResponse(connector=self.get_connector(connector_id), run=run), None
 
         privacy_result = self.privacy_firewall.check(
             PrivacyCheckRequest(
-                url=connector.definition.api_probe_url,
+                url=connector.api_probe_url(),
                 method="GET",
                 purpose="connector_api_fetch",
                 data_category="connector_metadata",
@@ -457,8 +1022,10 @@ class ConnectorManager:
             raise PrivacyPolicyError(privacy_result)
 
         try:
-            result = connector.sync(token)
-        except ConnectorError as error:
+            http_client = ConnectorHttpClient(self.privacy_firewall, connector_id)
+            result = connector.sync(ConnectorSyncContext(token=token, http_client=http_client))
+            items_written = self._write_connector_records(connector_id, result.records)
+        except (ConnectorError, ValueError) as error:
             run = self._complete_sync_run(run_id, status="failed", error_message=str(error))
             self._set_connector_error(connector_id, str(error))
             return ConnectorSyncResponse(connector=self.get_connector(connector_id), run=run), privacy_result
@@ -467,7 +1034,7 @@ class ConnectorManager:
             run_id,
             status="completed",
             items_seen=result.items_seen,
-            items_written=result.items_written,
+            items_written=items_written,
         )
         current = self.get_connector(connector_id)
         completed_at = run.completed_at or utc_timestamp()
@@ -594,13 +1161,76 @@ class ConnectorManager:
                     (message, timestamp, connector_id),
                 )
 
+    def _write_connector_records(self, connector_id: str, records: tuple[ConnectorRecord, ...]) -> int:
+        written = 0
+        for record in records:
+            if self._connector_record_exists(connector_id, record.external_id):
+                continue
+
+            memory = self.memory_store.create(
+                MemoryCreateRequest(
+                    type="connector_summary",
+                    title=record.title,
+                    summary=record.summary,
+                    content_markdown=record.content_markdown,
+                    source_type=connector_id,
+                    source_id=record.external_id,
+                    source_uri=record.source_uri,
+                    importance=3,
+                    tags=list(record.tags),
+                )
+            )
+            self._insert_connector_record(connector_id, record, memory.id)
+            written += 1
+        return written
+
+    def _connector_record_exists(self, connector_id: str, external_id: str) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM connector_items
+                WHERE connector_id = ? AND external_id = ?
+                """,
+                (connector_id, external_id),
+            ).fetchone()
+        return row is not None
+
+    def _insert_connector_record(self, connector_id: str, record: ConnectorRecord, memory_id: str) -> None:
+        timestamp = utc_timestamp()
+        with self.connect() as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO connector_items (
+                      id, connector_id, external_id, title, summary, source_uri,
+                      item_timestamp, normalized_json, memory_id, fetched_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"connector_item_{uuid.uuid4().hex}",
+                        connector_id,
+                        record.external_id,
+                        record.title,
+                        record.summary,
+                        record.source_uri,
+                        record.item_timestamp,
+                        json.dumps(record.normalized, sort_keys=True),
+                        memory_id,
+                        timestamp,
+                    ),
+                )
+
     def _row_to_connector(self, row: sqlite3.Row) -> ConnectorItem:
+        connector = self.registry.get(row["id"])
         return ConnectorItem(
             id=row["id"],
             name=row["name"],
             status=row["status"],
             enabled=bool(row["enabled"]),
             scopes=json.loads(row["scopes_json"]),
+            oauth_configured=connector.oauth_configured() if connector else False,
+            real_sync_supported=connector is not None,
             sync_interval_minutes=row["sync_interval_minutes"],
             last_sync_at=row["last_sync_at"],
             next_sync_at=row["next_sync_at"],
