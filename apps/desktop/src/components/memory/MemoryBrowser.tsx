@@ -1,5 +1,5 @@
 import type { AssistantSnapshot } from "../../stores/assistantStore";
-import { Download, FolderOpen, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
+import { CalendarDays, Download, FolderKanban, FolderOpen, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
 import { assistantStore } from "../../stores/assistantStore";
 
 interface MemoryBrowserProps {
@@ -69,6 +69,38 @@ export function MemoryBrowser({ snapshot }: MemoryBrowserProps) {
         </button>
       </div>
 
+      <div className="memory-summary-tools">
+        <button
+          className="inline-text-button"
+          type="button"
+          disabled={snapshot.memoryBusy}
+          onClick={() => void assistantStore.generateDailySummary()}
+        >
+          <CalendarDays size={13} aria-hidden="true" />
+          <span>Daily</span>
+        </button>
+        <input
+          value={snapshot.memoryProjectDraft}
+          placeholder="Project"
+          aria-label="Project summary name"
+          onChange={(event) => assistantStore.setMemoryProjectDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              void assistantStore.generateProjectSummary();
+            }
+          }}
+        />
+        <button
+          className="inline-text-button"
+          type="button"
+          disabled={snapshot.memoryBusy || !snapshot.memoryProjectDraft.trim()}
+          onClick={() => void assistantStore.generateProjectSummary()}
+        >
+          <FolderKanban size={13} aria-hidden="true" />
+          <span>Project</span>
+        </button>
+      </div>
+
       <div className="memory-create">
         <input
           value={snapshot.memoryDraft.title}
@@ -106,7 +138,16 @@ export function MemoryBrowser({ snapshot }: MemoryBrowserProps) {
               <div>
                 <strong>{item.title}</strong>
                 <span>{item.summary}</span>
-                <small>{item.markdownPath ?? item.sourceType}</small>
+                <small>{memoryDetailLabel(item)}</small>
+                {item.tags.length || item.actionItems.length || item.decisions.length ? (
+                  <div className="memory-extraction-row">
+                    {item.tags.slice(0, 3).map((tag) => (
+                      <em key={tag}>{tag}</em>
+                    ))}
+                    {item.actionItems.length ? <em>{item.actionItems.length} actions</em> : null}
+                    {item.decisions.length ? <em>{item.decisions.length} decisions</em> : null}
+                  </div>
+                ) : null}
               </div>
               <button
                 className="icon-button"
@@ -130,4 +171,10 @@ export function MemoryBrowser({ snapshot }: MemoryBrowserProps) {
       ) : null}
     </section>
   );
+}
+
+function memoryDetailLabel(item: AssistantSnapshot["memoryItems"][number]) {
+  const entityCount = item.entities.length;
+  const source = item.markdownPath ?? item.sourceType;
+  return entityCount ? `${source} | ${entityCount} entities | importance ${item.importance}` : source;
 }

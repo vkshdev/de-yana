@@ -32,6 +32,8 @@ export function ConnectorStatusList({ snapshot }: ConnectorStatusListProps) {
           <ConnectorRow
             connector={connector}
             busy={Boolean(snapshot.connectorBusy[connector.id])}
+            pendingOAuth={snapshot.connectorOAuth[connector.id]}
+            oauthCode={snapshot.connectorOAuthCodes[connector.id] ?? ""}
             key={connector.id}
           />
         ))}
@@ -47,7 +49,17 @@ export function ConnectorStatusList({ snapshot }: ConnectorStatusListProps) {
   );
 }
 
-function ConnectorRow({ connector, busy }: { connector: ConnectorItem; busy: boolean }) {
+function ConnectorRow({
+  connector,
+  busy,
+  pendingOAuth,
+  oauthCode
+}: {
+  connector: ConnectorItem;
+  busy: boolean;
+  pendingOAuth?: { state: string; authorizationUrl: string; expiresAt: string };
+  oauthCode: string;
+}) {
   const canSync = connector.tokenStored && connector.enabled && connector.status !== "syncing" && !busy;
   const canDisconnect = connector.tokenStored && connector.status !== "syncing" && !busy;
   const canConnect = !connector.tokenStored && !busy;
@@ -62,9 +74,28 @@ function ConnectorRow({ connector, busy }: { connector: ConnectorItem; busy: boo
         </div>
         <div className="connector-meta">
           <span>{connector.tokenStored ? "Token local" : "No token"}</span>
+          <span>{connector.oauthConfigured ? "OAuth ready" : "Local dev auth"}</span>
           <span>{connector.lastSyncAt ? compactDate(connector.lastSyncAt) : "Never synced"}</span>
           {connector.lastError ? <span className="connector-error-text">{connector.lastError}</span> : null}
         </div>
+        {pendingOAuth ? (
+          <div className="connector-oauth-row">
+            <input
+              aria-label={`${connector.name} OAuth code`}
+              value={oauthCode}
+              placeholder="OAuth code"
+              onChange={(event) => assistantStore.setConnectorOAuthCode(connector.id, event.currentTarget.value)}
+            />
+            <button
+              className="inline-text-button"
+              type="button"
+              disabled={busy || !oauthCode.trim()}
+              onClick={() => void assistantStore.completeConnectorOAuth(connector.id)}
+            >
+              Link
+            </button>
+          </div>
+        ) : null}
         <div className="connector-settings-row">
           <label className="connector-toggle" title={connector.enabled ? "Pause sync" : "Enable sync"}>
             <input
@@ -101,8 +132,8 @@ function ConnectorRow({ connector, busy }: { connector: ConnectorItem; busy: boo
             <button
               className="inline-icon-button"
               type="button"
-              title="Approve mock OAuth"
-              aria-label={`Approve mock OAuth for ${connector.name}`}
+              title={connector.oauthConfigured ? "Connect OAuth" : "Connect local dev token"}
+              aria-label={`Connect ${connector.name}`}
               disabled={!canConnect}
               onClick={() => void assistantStore.connectConnector(connector.id)}
             >
