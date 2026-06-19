@@ -60,6 +60,39 @@ def test_memory_create_writes_sqlite_and_markdown(tmp_path) -> None:
     assert row == ("Shipping checklist", "Release gate notes")
 
 
+def test_memory_pipeline_extracts_actions_decisions_entities_and_tags(tmp_path) -> None:
+    vault_path = tmp_path / "Vault"
+
+    with make_client(tmp_path) as client:
+        complete_onboarding(client, vault_path)
+        response = client.post(
+            "/memory",
+            json={
+                "type": "note",
+                "title": "DEYANA launch review",
+                "contentMarkdown": (
+                    "Alex approved using local summaries for DEYANA. "
+                    "Need to follow up with founder@example.com by 2026-06-30. "
+                    "Track repo deyana/local-assistant."
+                ),
+            },
+        )
+        search = client.get("/memory", params={"query": "founder@example.com"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"]
+    assert body["importance"] >= 4
+    assert "action-item" in body["tags"]
+    assert "decision" in body["tags"]
+    assert body["actionItems"]
+    assert body["decisions"]
+    assert any(entity["name"] == "founder@example.com" for entity in body["entities"])
+    assert "## Extracted action items" in body["contentMarkdown"]
+    assert search.status_code == 200
+    assert search.json()["total"] == 1
+
+
 def test_manual_markdown_edit_can_be_reindexed_and_searched(tmp_path) -> None:
     vault_path = tmp_path / "Vault"
 
@@ -118,6 +151,36 @@ def test_memory_export_and_delete(tmp_path) -> None:
     assert list_response.json()["total"] == 0
     assert get_deleted.status_code == 404
     assert not Path(created["markdownPath"]).exists()
+
+
+def test_daily_and_project_summaries_are_generated_as_memory(tmp_path) -> None:
+    vault_path = tmp_path / "Vault"
+
+    with make_client(tmp_path) as client:
+        complete_onboarding(client, vault_path)
+        client.post(
+            "/memory",
+            json={
+                "type": "note",
+                "title": "Project Cipher decision",
+                "summary": "Cipher should keep local-only memory.",
+                "contentMarkdown": "Decision: choose local-only memory. Next step: update Cipher docs.",
+                "tags": ["cipher"],
+            },
+        )
+        daily = client.post("/memory/summaries/daily", json={})
+        project = client.post("/memory/summaries/project", json={"project": "Cipher"})
+
+    assert daily.status_code == 200
+    assert daily.json()["type"] == "daily_summary"
+    assert daily.json()["markdownPath"]
+    assert Path(daily.json()["markdownPath"]).is_file()
+
+    assert project.status_code == 200
+    assert project.json()["type"] == "project_summary"
+    assert "Cipher" in project.json()["title"]
+    assert project.json()["markdownPath"]
+    assert Path(project.json()["markdownPath"]).is_file()
 
 
 def test_memory_create_requires_vault(tmp_path) -> None:
