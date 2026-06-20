@@ -251,6 +251,10 @@ export interface OnboardingCompleteResponse {
 export interface MemoryEntity {
   id: string;
   memoryId: string;
+  memoryTitle?: string | null;
+  sourceType?: string | null;
+  sourceId?: string | null;
+  sourceUri?: string | null;
   name: string;
   entityType: string;
   sourceText: string;
@@ -262,6 +266,10 @@ export type MemoryInsightType = "action_item" | "decision";
 export interface MemoryInsight {
   id: string;
   memoryId: string;
+  memoryTitle?: string | null;
+  sourceType?: string | null;
+  sourceId?: string | null;
+  sourceUri?: string | null;
   type: MemoryInsightType;
   title: string;
   detail: string;
@@ -314,6 +322,19 @@ export interface MemoryListResponse {
   items: MemoryItem[];
   total: number;
   query?: string | null;
+}
+
+export interface MemoryEntityListResponse {
+  items: MemoryEntity[];
+  total: number;
+  query?: string | null;
+}
+
+export interface MemoryInsightListResponse {
+  items: MemoryInsight[];
+  total: number;
+  type?: MemoryInsightType | null;
+  status?: string | null;
 }
 
 export interface MemoryDeleteResponse {

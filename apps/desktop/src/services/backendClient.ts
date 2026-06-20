@@ -22,7 +22,9 @@ import type {
   LocalModelStatusResponse,
   MemoryCreateRequest,
   MemoryDeleteResponse,
+  MemoryEntityListResponse,
   MemoryExportResponse,
+  MemoryInsightListResponse,
   MemoryItem,
   MemoryListResponse,
   MemoryReindexResponse,
@@ -257,6 +259,38 @@ export const backendClient = {
       throw new Error(`memory export returned ${response.status}`);
     }
     return response.json() as Promise<MemoryExportResponse>;
+  },
+
+  async listMemoryEntities(query?: string): Promise<MemoryEntityListResponse> {
+    const params = new URLSearchParams();
+    params.set("limit", "100");
+    if (query?.trim()) {
+      params.set("query", query.trim());
+    }
+    const response = await fetch(`${coreService.endpoint}/memory/entities?${params.toString()}`);
+    if (!response.ok) {
+      throw new Error(`memory entities returned ${response.status}`);
+    }
+    return response.json() as Promise<MemoryEntityListResponse>;
+  },
+
+  async listMemoryInsights(
+    type?: "action_item" | "decision",
+    status?: string
+  ): Promise<MemoryInsightListResponse> {
+    const params = new URLSearchParams();
+    params.set("limit", "100");
+    if (type) {
+      params.set("type", type);
+    }
+    if (status?.trim()) {
+      params.set("status", status.trim());
+    }
+    const response = await fetch(`${coreService.endpoint}/memory/insights?${params.toString()}`);
+    if (!response.ok) {
+      throw new Error(`memory insights returned ${response.status}`);
+    }
+    return response.json() as Promise<MemoryInsightListResponse>;
   },
 
   async getModelStatus(): Promise<LocalModelStatusResponse> {
