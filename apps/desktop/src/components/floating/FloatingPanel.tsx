@@ -13,6 +13,7 @@ import { MemoryBrowser } from "../memory/MemoryBrowser";
 import { ModelSetupPanel } from "./ModelSetupPanel";
 import { PrivacyAuditPanel } from "./PrivacyAuditPanel";
 import { QuickActions } from "./QuickActions";
+import { ToolPanel } from "./ToolPanel";
 
 interface FloatingPanelProps {
   snapshot: AssistantSnapshot;
@@ -78,6 +79,7 @@ export function FloatingPanel({ snapshot }: FloatingPanelProps) {
         <PrivacyAuditPanel snapshot={snapshot} />
 
         <QuickActions actions={snapshot.quickActions} />
+        <ToolPanel snapshot={snapshot} />
         <MemoryBrowser snapshot={snapshot} />
         <ConnectorStatusList snapshot={snapshot} />
       </div>
